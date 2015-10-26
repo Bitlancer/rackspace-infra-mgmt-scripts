@@ -1,0 +1,572 @@
+#!/usr/bin/php
+<?php
+
+define('DEBUG', false);
+
+SimpleRackspaceCli::main($argc, $argv);
+
+class SimpleRackspaceCli {
+
+    function usage($func){
+
+        exit(1);
+    }
+
+    function main($argc, $argv) {
+
+        if(count($argv) < 2)
+            self::usage($argv[0]);
+
+        $cmd = array_shift($argv);
+        $argc--;
+
+        $subcmd = array_shift($argv);
+        $argc--;
+
+        $action = array_shift($argv);
+        $argc--;
+
+        $cli = new SimpleRackspaceCli();
+        $method = "$subcmd" . ucfirst($action);
+
+        call_user_func(array(__CLASS__, $method), $argc, $argv);
+    }
+
+    function serverCreate($argc, $argv) {
+
+        $params = self::getOpts(
+            array(
+                'name:',
+                'image:',
+                'flavor:',
+                'userdata:',
+                'wait'
+            ),
+            $argv
+        );
+
+        array_map(function($reqParam) use($params) {
+            if(empty($params[$reqParam])){
+                echo "{$reqParam} is required\n";
+                exit(1);
+            }
+        }, array('name', 'image', 'flavor'));
+
+        $name = $params['name'];
+        $image = $params['image'];
+        $flavor = $params['flavor'];
+        $userDataFile = (isset($params['userdata']) ? $params['userdata'] : false);
+        $wait = isset($params['wait']) && $params['wait'] == true;
+
+        $rsClient = self::getRSClient();
+        $result = $rsClient->serverCreate(
+            $name,
+            $image,
+            $flavor,
+            $userDataFile
+        );
+
+        $serverId = $result['server']['id'];
+        $adminPass = $result['server']['adminPass'];
+
+        if($wait) {
+            $lastStatus = $rsClient->serverWaitForStatusChange($serverId);
+            if($lastStatus != 'ACTIVE')
+                throw new Exception('Error during build process. See provider control panel.');
+        }
+
+        echo json_encode($rsClient->serverDetails($serverId));
+    }
+
+    function serverDelete($argc, $argv) {
+
+        if($argc != 1){
+            echo "A name is required.\n";
+            exit(1);
+        }
+        $name = $argv[0];
+
+        $rsClient = self::getRSClient();
+        $results = $rsClient->serversByName($name);
+        if(count($results['servers']) > 1){
+            echo "More then one server matches this name";
+            exit(1);
+        }
+
+        $serverId = $results['servers'][0]['id'];
+        $results = $rsClient->serverDelete($serverId);    
+
+        echo $results;
+    }
+
+    function serverImgsched($argc, $argv) {
+
+         if(!isset($argv[0])){
+            echo "A name is required.\n";
+            exit(1);
+        }
+        $name = array_shift($argv);
+
+        $params = self::getOpts(
+            array(
+                'retention:',
+            ),
+            $argv
+        );
+
+        $retention = (int)$params['retention'];
+        if(!is_int($retention)){
+            echo "A rentention value is required and must be an integer.\n";
+            exit(1);
+        }
+
+        $rsClient = self::getRSClient();
+        $results = $rsClient->serversByName($name);
+        if(count($results['servers']) > 1){
+            echo "More then one server matches this name";
+            exit(1);
+        }
+        $serverId = $results['servers'][0]['id'];
+
+        $result = $rsClient->serverEnableScheduledImages(
+            $serverId,
+            $retention
+        ); 
+
+        echo json_encode($result);
+    }
+
+    function dnsrecordCreate($argc, $argv) {
+
+         $params = self::getOpts(
+            array(
+                'domain:',
+                'type:',
+                'name:',
+                'data:',
+                'ttl::'
+            ),
+            $argv
+        );
+
+        $domain = $params['domain'];
+        $type = $params['type'];
+        $name = $params['name'];
+        $data = $params['data'];
+        $ttl = (isset($params['ttl']) ? $params['ttl'] : '300');
+
+        $rsClient = self::getRSClient();
+        $results = $rsClient->dnsDomainsByName($domain);
+        if(count($results['domains']) > 1){
+            echo "More then one domains matches this name";
+            exit(1);
+        }
+        $domainId = $results['domains'][0]['id'];
+
+        $result = $rsClient->dnsRecordAdd(
+            $domainId,
+            'A',
+            $name,
+            $data,
+            $ttl
+        ); 
+
+        echo json_encode($result);
+    }
+
+    function dnsrecordDelete($argc, $argv) {
+
+         $params = self::getOpts(
+            array(
+                'domain:',
+                'type:',
+                'name:',
+            ),
+            $argv
+        );
+
+        $domain = $params['domain'];
+        $type = $params['type'];
+        $name = $params['name'];
+
+        $rsClient = self::getRSClient();
+        $results = $rsClient->dnsDomainsByName($domain);
+        if(count($results['domains']) > 1){
+            echo "More then one domains matches this name";
+            exit(1);
+        }
+        $domainId = $results['domains'][0]['id'];
+
+        $result = $rsClient->dnsRecordDelete(
+            $domainId,
+            $type,
+            $name
+        );
+    }
+
+    function getOpts($options, $argv){
+
+        $params = array();
+
+        while(($param = array_shift($argv)) != NULL) {
+            $param = trim($param, "-");
+            foreach($options as $option){
+                $optionName = trim($option, ":");
+                $hasValue = preg_match('/:$/', $option) == 1;
+                
+                if($param == $optionName){
+                    if($hasValue)
+                        $params[$optionName] = array_shift($argv);
+                    else {
+                        $params[$optionName] = true;
+                    }
+                }
+            }
+        }
+
+        return $params;
+    }
+
+    function getRSClient() {
+
+        return new SimpleRackspaceClient(
+            getenv('OS_USERNAME'),
+            getenv('OS_PASSWORD'),
+            getenv('OS_AUTH_URL'),
+            getenv('OS_REGION_NAME')
+        );
+    }
+}
+
+class SimpleRackspaceClient {
+
+    private $identityUrl;
+    private $username;
+    private $apiKey;
+    private $region;
+    private $token = false;
+
+
+    public function __construct($username, $apiKey, $identityUrl, $region=DFW) {
+
+        $this->username = $username;
+        $this->apiKey = $apiKey;
+
+        $this->identityUrl = $identityUrl;
+        $this->region = $region;
+    }
+
+    public function serverCreate($name, $image, $flavor, $cloudConfigFile=false){
+
+        $data = array(
+            'server' => array(
+                'name' => $name,
+                'imageRef' => $image,
+                'flavorRef' => $flavor
+            )
+        );
+
+        if($cloudConfigFile !== false){
+
+            $data['server']['config_drive'] = true;
+            $data['server']['user_data'] = base64_encode(
+                file_get_contents($cloudConfigFile)
+            );
+        }
+
+        $result = $this->request(
+            'cloudServersOpenStack',
+            '/servers',
+            'POST',
+            $data
+        );
+
+        if($result[1] != '202')
+            throw new Exception(print_r($result[0], true));
+
+        return $result[0];
+    }
+
+    public function serverDelete($serverId) {
+
+        $result = $this->request(
+            'cloudServersOpenStack',
+            "/servers/{$serverId}",
+            'DELETE'
+        );
+
+        if($result[1] != '204')
+            throw new Exception(print_r($result[0], true));
+
+        return $result[0];
+    }
+
+    public function serverDetails($serverId) {
+
+        $result = $this->request(
+            'cloudServersOpenStack',
+            "/servers/{$serverId}"
+        );
+
+        if($result[1] != '200')
+            throw new \Exception(print_r($result[0], true));
+
+        return $result[0];
+    }
+
+    public function serversByName($name) {
+
+        $name = urlencode($name);
+
+        $result = $this->request(
+            'cloudServersOpenStack',
+            "/servers?name={$name}"
+        );
+
+        if($result[1] != '200')
+            throw new \Exception(print_r($result[0], true));
+
+        return $result[0];
+    }
+
+    public function serverWaitForStatusChange($serverId){
+
+        $origStatus = 'UNKNOWN';
+        $lastStatus = 'UNKNOWN';
+
+        while(true) {
+            $serverDetails = $this->serverDetails($serverId);
+            $lastStatus = $serverDetails['server']['status'];
+
+            if($origStatus == 'UNKNOWN')
+                $origStatus = $lastStatus;
+
+            if($lastStatus != $origStatus)
+                break;
+
+            sleep(5);
+        }
+
+        return $lastStatus;
+    }
+
+    public function serverEnableScheduledImages($serverId, $retention){
+
+        $result = $this->request(
+            'cloudServersOpenStack',
+            "/servers/{$serverId}/rax-si-image-schedule",
+            'POST',
+            array(
+                "image_schedule" => array(
+                    "retention" => $retention
+                )
+            )
+        );
+
+        if($result[1] != '200')
+            throw new Exception(print_r($result[0], true));
+
+        return $result[0];
+    }
+
+    public function dnsDomainsByName($domain){
+
+        $domain = urlencode($domain);
+
+        $result = $this->request(
+            'cloudDNS',
+            "/domains/?name=" . $domain
+        );
+
+        if($result[1] != '200')
+            throw new Exception(print_r($result[0], true));
+
+        return $result[0];
+    }
+
+    public function dnsRecordAdd($domainId, $type, $name, $data, $ttl){
+
+        $result = $this->request(
+            'cloudDNS',
+            "/domains/{$domainId}/records",
+            'POST',
+            array(
+                'records' => array(array(
+                    'name' => $name,
+                    'type' => $type,
+                    'data' => $data,
+                    'ttl' => $ttl
+                ))
+            )
+        );
+
+        if($result[1] != '202')
+            throw new Exception(print_r($result[0], true));
+
+        return $result[0];
+    }
+
+    public function dnsRecordDelete($domainId, $type, $name){
+
+        $name = urlencode($name);
+
+        $result = $this->request(
+            'cloudDNS',
+            "/domains/{$domainId}/records?type={$type}&name={$name}"
+        );
+
+        if($result[1] != '200')
+            throw new Exception(print_r($result[0], true));
+
+        $records = $result[0]['records'];
+
+        if(count($records) > 1)
+            throw new Exception('Found two or more records matching the supplied criteria');
+        elseif(count($records) == 0)
+            throw new Exception('No record found');
+
+        $recordId = $records[0]['id'];
+
+        $result = $this->request(
+            'cloudDNS',
+            "/domains/{$domainId}/records?id={$recordId}",
+            'DELETE'
+        );
+
+        if($result[1] != '202')
+            throw new Exception(print_r($result[0]), true);
+    }
+
+    public function request($service, $endpoint, $method='GET', $data=false){
+
+        if(empty($this->token)){
+            $this->refreshAuthInfo();
+        }
+
+        $url = $this->getServiceUrl($service) . $endpoint;
+        $data = $data !== false ? json_encode($data) : false;
+        $headers = $this->getHeaders();
+
+        list($response,
+            $httpStatus) = $this->curlRequest($url, $method, $data, $headers);
+
+        $parsedResponse = json_decode($response, true);
+
+        return array(
+            $parsedResponse,
+            $httpStatus
+        );
+    }
+
+    private function getServiceUrl($service) {
+
+        return $this->extractServiceUrl(
+            $this->authInfo,
+            $service,
+            $this->region
+        );
+    }
+
+    private function refreshAuthInfo() {
+
+        $this->authInfo = $this->getAuthInfo(
+            $this->identityUrl,
+            $this->username,
+            $this->apiKey
+        );
+
+        $this->token = $this->extractToken($this->authInfo);
+    }
+
+    private function getHeaders(){
+
+        $defaultHeaders = array(
+            "Accept: application/json",
+            "Content-Type: application/json",
+            "Accept-Language: en-US,en"
+        );
+
+        $headers = $defaultHeaders;
+
+        if(!empty($this->token))
+            $headers[] = "X-Auth-Token: $this->token";
+
+        return $headers;
+    }
+
+    private function extractServiceUrl($auth_info, $service, $region){
+        $region = strtoupper($region);
+        $valid_service_names = array();
+        $service_catelog = $auth_info['access']['serviceCatalog'];
+        foreach($service_catelog as $service_details){
+            $service_name = $service_details['name'];
+            $valid_service_names[] = $service_name;
+            if($service == $service_name){
+                foreach($service_details['endpoints'] as $endpoint){
+                    if(!isset($endpoint['region'])){
+                        return $endpoint['publicURL'];
+                    }
+                    if($endpoint['region'] == $region)
+                        return $endpoint['publicURL'];
+                }
+            }
+        }
+        throw new \InvalidArgumentException("Invalid service or service region supplied.");
+    }
+
+    private function extractToken($auth_info){
+        return $auth_info['access']['token']['id'];
+    }
+
+    private function getAuthInfo($identity_uri, $username, $apiKey){
+
+        $token_uri = $identity_uri . "tokens";
+
+        $auth_data = array(
+            "auth" => array(
+                "RAX-KSKEY:apiKeyCredentials" => array(
+                    "username" => $username,
+                    "apiKey" => $apiKey
+                )
+            )
+        );
+
+        list($auth_info,$code) = $this->curlRequest(
+            $token_uri,
+            "POST",
+            json_encode($auth_data),
+            array(
+                'Content-Type: application/json'
+            )
+        );
+
+        if($code != 200)
+            throw new \RuntimeException("Failed to authenticate, $auth_info");
+
+        $auth_info = json_decode($auth_info, true);
+        return $auth_info;
+    }
+
+    function curlRequest($url, $method='GET', $data=false, $headers=array()){
+
+        $ch = curl_init();
+
+        curl_setopt($ch, CURLOPT_URL, $url);
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
+        if($data !== false)
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+        if(DEBUG)
+            curl_setopt($ch, CURLOPT_VERBOSE, true);
+
+        $output = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+        curl_close($ch);
+
+        return array($output, $code);
+    }
+
+}
+

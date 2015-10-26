@@ -1,0 +1,3 @@
+#!/bin/sh
+
+./puppetwrapper node list

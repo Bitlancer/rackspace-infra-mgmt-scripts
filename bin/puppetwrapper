@@ -1,0 +1,80 @@
+#!/bin/sh
+
+NODES_DOMAIN="org-infra.net"
+
+NODE_LIST_FACTS="role,r10k_environment,memorysize"
+
+function usage {
+    
+    echo "$0 node [list|cleanup]"
+    echo "$0 cert [accept]"
+}
+
+function main {
+
+    subcmd=$1
+    shift
+    action=$1
+    shift
+    params=$@
+
+    func="${subcmd}_${action}"
+
+    $func "$params"
+}
+
+function cert_acceptwait {
+
+    name=$1
+    if [ -z $name ]; then
+        echo "A name is required"
+        exit 1
+    fi
+
+    while [ true ]; do
+        cert=$(puppet cert list $name 2>&1)
+        if [ $? -eq 0 ]; then
+            break
+        fi
+        sleep 5
+    done
+
+    puppet cert sign $name
+}
+
+function node_list {
+
+    format=$1
+
+    export RUBYLIB=../lib/puppet-puppetdbquery/lib:$RUBYLIB
+    node_data=$(puppet query facts --facts $NODE_LIST_FACTS "domain = '$NODES_DOMAIN'")
+    echo "$node_data" | while read -r line; do
+        node=${line%% *}
+        data=${line#* }
+        
+        if [ -z $format ]; then
+            echo $node
+            echo $data
+            echo
+        elif [ $format == "simple" ]; then
+            echo $node
+        else
+            echo "Unexpected format type"
+            exit 1
+        fi
+    done
+}
+
+function node_cleanup {
+
+    name=$1
+    if [ -z $name ]; then
+        echo "A name is required"
+        exit 1 
+    fi
+
+    puppet cert clean $name
+    puppet node deactivate $name
+}
+
+main "$@"

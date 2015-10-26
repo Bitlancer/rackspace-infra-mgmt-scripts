@@ -1,0 +1,3 @@
+#!/bin/sh
+
+r10k deploy environment -p

@@ -1,0 +1,310 @@
+#!/bin/bash
+
+function main {
+    # Main entry point for the application
+
+    mydir=$(dirname $0)
+    export PATH=$mydir:$PATH
+
+    welcome
+    check_requirements
+    source ~/.infra-mgmt-config
+
+    input || exit 1
+
+    echo "Launching instance"
+    instance_data=$(launch_instance)
+    if [ $? -ne 0 ]; then
+        echo $instance_data
+        exit 1
+    fi
+
+    echo "Creating DNS entries"
+    create_dns_entries "$instance_data" || exit 2
+
+    echo "Scheduling image backups"
+    schedule_images || exit 2
+
+    echo "Waiting to accept Puppet certificate"
+    puppet_accept_cert || exit 2
+}
+
+function launch_instance {
+    # Handles launching an instance
+
+    write_cloud_config_file
+
+    result=$(rackspace server create \
+        --name "$INSTANCE_FQDN" \
+        --image "$INSTANCE_IMAGE" \
+        --flavor "$INSTANCE_FLAVOR" \
+        --userdata "$INSTANCE_CLOUD_CONFIG_FILE" \
+        --wait)
+
+    if [ $? -ne 0 ]; then
+        echo "$result"
+        return 1
+    fi
+
+    echo $result
+    return 0
+}
+
+function extract_key_from_json {
+    # Extract a value by key from a json data struct
+    # This is far from a perfect solution.
+
+    echo $2 | egrep -o "\"$1\":\"[^\"]+\"" | cut -d"\"" -f4
+    return $?
+}
+
+function create_dns_entries {
+    # Create external and internal dns entries for the instance
+
+    instance_private_ipv4_addr=""
+    instance_public_ipv4_addr=""
+
+    addresses=$(extract_key_from_json addr $1)
+    echo "$addresses" | while read addr; do
+        if [ -z "$addr" ]; then
+            continue
+        elif [[ $addr =~ ":" ]]; then
+            continue
+        elif [[ $addr =~ ^10\. ]]; then
+            result=$(rackspace dnsrecord create \
+                --domain $INFRA_DNS_DOMAIN \
+                --type A \
+                --name $INSTANCE_INT_FQDN \
+                --data $addr)
+
+            if [ $? -ne 0 ]; then
+                echo "Failed to create public DNS record"
+                echo $result
+                return 1
+            fi
+        else
+            result=$(rackspace dnsrecord create \
+                --domain $INFRA_DNS_DOMAIN \
+                --type A \
+                --name $INSTANCE_FQDN \
+                --data $addr)
+
+            if [ $? -ne 0 ]; then
+                echo "Failed to create private DNS record"
+                echo $result
+                return 1
+            fi
+        fi
+    done
+
+    return 0
+}
+
+function schedule_images {
+    # Enable scheduled images of instance
+
+    result=$(rackspace server imgsched $INSTANCE_FQDN --retention $INFRA_IMG_RETENTION)
+
+    if [ $? -ne 0 ]; then
+        echo "Failed to setup scheduled images"
+        echo $result
+        return 1
+    fi
+    
+    return $?
+}
+
+function puppet_accept_cert {
+    # Wait for, and accept the Puppet certificate
+
+    result=$(puppetwrapper cert acceptwait $INSTANCE_FQDN)
+    if [ $? -ne 0 ]; then
+        echo $result
+        return 1
+    fi
+
+    return 0
+}
+
+function write_cloud_config_file {
+    # Writes the Cloud-Init config that's responsible for
+    # bootstrapping the instance.
+
+    INSTANCE_CLOUD_CONFIG_FILE="/tmp/cloud-config-$INSTANCE_NAME"
+
+cat << SCRIPT > $INSTANCE_CLOUD_CONFIG_FILE
+#cloud-config
+
+runcmd:
+ - yum install -y https://yum.puppetlabs.com/puppetlabs-release-el-6.noarch.rpm
+ - yum install -y puppet
+ - >
+    puppet apply -e "
+        exec { '/bin/mkdir -p /etc/facter/facts.d':
+        }->
+        file { '/etc/facter/facts.d/org.txt':
+            ensure => file,
+            content => 'role=$INSTANCE_ROLE'
+        }
+        augeas { 'puppet_conf':
+            context => '/files/etc/puppet/puppet.conf/main',
+            changes => [
+                'set certname $INSTANCE_FQDN',
+                'set environment $INSTANCE_ENVIRONMENT',
+                'set server $INFRA_PUPPETMASTER_HOST',
+            ]
+        }
+    "
+ - chkconfig puppet on
+ - yum update -y
+ - reboot
+
+SCRIPT
+
+}
+
+function input {
+    # Gets all input from the user and sets appropriate variables
+
+    suggested_name=$(available_name)
+    echo "What would you like to name this instance?"
+    echo "Suggestion: ${suggested_name}"
+    echo "Leave this blank to accept the suggested name"
+    read -p "> " instance_name
+    if [ -z "$instance_name" ]; then
+        instance_name=$suggested_name
+    fi
+    is_name_available $instance_name.$INFRA_DNS_SUFFIX
+    if [ $? -eq 0 ]; then
+        echo "This name is already taken."
+        exit 1
+    fi
+    echo
+
+    echo "What environment would you like to assign to this instance?"
+    echo "Suggestions: production, development"
+    read -p "> " instance_environment
+    if [ -z "$instance_environment" ]; then
+        echo "An environment is required."
+        exit 1
+    fi
+    echo
+
+    echo "What role would you like to assign to this instance?"
+    echo "Leave this empty for the base role"
+    read -p "> " instance_role
+    if [ -z "$instance_role" ]; then
+        instance_role="org::role"
+    else
+        instance_role="org::role::${instance_role}"
+    fi
+    echo
+
+    echo "Select a flavor: "
+    PS3='> '
+    options=(
+        "512MB Standard Instance [.022/hr] (1 CPU; 512MB; 20GB)"
+        "1 GB General [.032/hr] (1 CPU; 1GB; 20GB)"
+        "2 GB General [.064/hr] (2 CPU; 2GB; 40GB)"
+        "2 GB Performance (2 CPU; 2GB; 40GB,20GB)"
+        "4 GB General [.128/hr] (4 CPU; 4GB; 80GB)"
+        "8 GB General [.256/hr] (8 CPU; 8GB; 160GB)"
+    )
+    select opt in "${options[@]}"
+    do
+        case $opt in
+            "512MB Standard Instance [.022/hr] (1 CPU; 512MB; 20GB)")
+                instance_flavor="2"
+                break
+                ;;
+            "1 GB General [.032/hr] (1 CPU; 1GB; 20GB)")
+                instance_flavor="general1-1"
+                break
+                ;;
+            "2 GB General [.064/hr] (2 CPU; 2GB; 40GB)")
+                instance_flavor="general1-2"
+                break
+                ;;
+            "2 GB Performance (2 CPU; 2GB; 40GB,20GB)")
+                instance_flavor="performance1-2"
+                break
+                ;;
+            "4 GB General [.128/hr] (4 CPU; 4GB; 80GB)")
+                instance_flavor="general1-4"
+                break
+                ;;
+            "8 GB General [.256/hr] (8 CPU; 8GB; 160GB)")
+                instance_flavor="general1-8"
+                break
+                ;;
+            *)
+                echo "Invalid flavor specified."
+                return 1
+        esac
+    done
+    echo
+
+    INSTANCE_NAME=$instance_name
+    INSTANCE_FQDN=$INSTANCE_NAME.$INFRA_DNS_SUFFIX
+    INSTANCE_INT_FQDN=$INSTANCE_NAME.$INFRA_INT_DNS_SUFFIX
+
+    INSTANCE_ENVIRONMENT=$instance_environment
+    INSTANCE_ROLE=$instance_role
+    INSTANCE_FLAVOR=$instance_flavor
+    INSTANCE_IMAGE=$INFRA_DEFAULT_IMAGE
+
+    return 0
+}
+
+function available_name {
+    # Get an available instance name from the dictionary
+
+    name=""
+
+    while [ true ]; do
+        name=$(shuf -n 1 $INFRA_NAME_DICT | tr '[:upper:]' '[:lower:]')
+        is_name_available $name.$INFRA_DNS_SUFFIX
+        if [ $? -eq 1 ]; then
+            break
+        fi
+    done
+
+    echo $name
+    return 0
+}
+
+function is_name_available {
+    # Determine if an instance name is already in use
+
+    nslookup $1 >/dev/null 2>&1
+    return $?
+}
+
+function check_requirements {
+    # Verify the user's machine meets all of the requirements
+    # to run this script
+
+    if [ ! -f ~/.infra-mgmt-config ]; then
+        echo "Could not find config file. See README.md for details"
+        return 1
+    fi
+
+    if [ ! -f rackspace ]; then
+        echo "The Rackspace client is needed."
+        return 1
+    fi
+
+    if [ ! -f puppetwrapper ]; then
+        echo "The Puppet wrapper client is needed."
+        return 1
+    fi
+}
+
+function welcome {
+
+    echo
+    echo " -- Instance Bootstrapper -- "
+    echo
+}
+
+main "$@"

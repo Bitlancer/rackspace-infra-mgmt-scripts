@@ -1,0 +1,56 @@
+#!/bin/bash
+
+# Simple upgrade script
+
+# The servers that will be upgraded
+upgrade_servers=$(puppetwrapper node list simple)
+
+# The following commands are run pre and post upgrade.
+# Services are killed to free memory. Without this addnl
+# memory yum may crash leaving the machine broken.
+pre_upgrade_commands='
+services="puppet ntpd postfix httpd php-fpm tomcat mysql slapd"
+for service in $services; do
+  sudo chkconfig --list $service &>/dev/null
+  if [ $? -eq 0 ]; then
+    sudo service $service stop
+  fi
+done
+'
+post_upgrade_commands='
+services="puppet ntpd postfix httpd php-fpm tomcat mysql slapd"
+for service in $services; do
+  sudo chkconfig --list $service &>/dev/null
+  if [ $? -eq 0 ]; then
+    sudo service $service start
+  fi
+done
+'
+
+# Upgrade servers
+for server in $upgrade_servers; do
+  echo "Checking $server for updates"
+  updates=$(ssh $server 'sudo yum clean all && sudo yum check-update')
+  if [ $? -eq 0 ]; then
+    echo 'No Packages marked for update. Skipping.'
+  else
+    echo "$updates"
+    echo "Most system services will be shut down for the following upgrade."
+    read -p "Continue with upgrade? (Y/n):" should_upgrade
+    if [ "$should_upgrade" == "Y" ] || [ "$should_reboot" == "y" ]; then
+      ssh $server "$pre_upgrade_commands"
+      ssh $server "sudo yum update -y"
+      ssh $server "$post_upgrade_commands"
+      read -p "Reboot server? (Y/n): " should_reboot
+      if [ "$should_reboot" == "Y" ] || [ "$should_reboot" == "y" ]; then
+        ssh $server "sudo reboot"
+        echo -n "Rebooting server..."
+        sleep 10
+        while ! ping -c1 $server &>/dev/null; do echo -n . && sleep 3; done
+        echo "up"
+      fi
+    fi
+  fi
+  echo '------------------------------------------------'
+done
+

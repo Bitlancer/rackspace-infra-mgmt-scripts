@@ -1,0 +1,19 @@
+# Rackspace settings - nova client variables
+export OS_USERNAME=
+export OS_TENANT_NAME=
+export OS_PASSWORD=
+export OS_AUTH_URL=https://identity.api.rackspacecloud.com/v2.0/
+export OS_REGION_NAME=DFW
+
+# DNS settings
+export INFRA_DNS_DOMAIN="org-infra.net"
+export INFRA_DNS_SUFFIX="dfw01.$INFRA_DNS_DOMAIN"
+export INFRA_INT_DNS_SUFFIX="dfw01.int.$INFRA_DNS_DOMAIN"
+
+# Puppet settings
+export INFRA_PUPPETMASTER_HOST="puppet.services.$INFRA_INT_DNS_SUFFIX"
+
+# Bootstrap settings
+export INFRA_DEFAULT_IMAGE="aa68fd54-2f9a-42c3-9901-4035e2738830"
+export INFRA_NAME_DICT="../misc/dictionary.txt"
+export INFRA_IMG_RETENTION="30"

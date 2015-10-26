@@ -1,0 +1,87 @@
+#!/bin/bash
+
+function main {
+    # Main entry point for the application
+
+    export PATH=./:$PATH
+
+    check_requirements
+    source ~/.infra-mgmt-config
+
+    name=$1
+    if [ -z "$name" ]; then
+        echo "A name is required"
+        exit 1
+    fi
+
+    echo "Are you sure you want to delete ${name}?"
+    echo "Press [Enter] to continue"
+    read _
+
+    result=$(delete_instance $name)
+    if [ $? -ne 0 ]; then
+        echo $result
+        exit 1
+    fi
+
+    result=$(delete_dns_entries $name)
+    if [ $? -ne 0 ]; then
+        echo $result
+        exit 1
+    fi
+
+    result=$(puppet_cleanup_node $name)
+    if [ $? -ne 0 ]; then
+        echo $result
+        exit 1
+    fi
+
+    exit 0 
+}
+
+function check_requirements {
+    # Verify the user's machine meets all of the requirements
+    # to run this script
+
+    if [ ! -f ~/.infra-mgmt-config ]; then
+        echo "Could not find config file. See README.md for details"
+        return 1
+    fi
+
+    if [ ! -f rackspace ]; then
+        echo "The Rackspace client is needed."
+        return 1
+    fi
+
+    if [ ! -f puppetwrapper ]; then
+        echo "The Puppet wrapper client is needed."
+        return 1
+    fi
+}
+
+function delete_instance {
+    # Delete the instance identified by $1
+
+    fqdn="${1}.${INFRA_DNS_SUFFIX}"
+
+    rackspace server delete $fqdn
+    return $?
+}
+
+function delete_dns_entries {
+    # Cleanup DNS entries
+
+    ext_fqdn="${1}.${INFRA_DNS_SUFFIX}"
+    int_fqdn="${1}.${INFRA_INT_DNS_SUFFIX}"
+
+    rackspace dnsrecord delete --domain $INFRA_DNS_DOMAIN --type A --name $ext_fqdn
+    rackspace dnsrecord delete --domain $INFRA_DNS_DOMAIN --type A --name $int_fqdn
+}
+
+function puppet_cleanup_node {
+    # Clean up Puppet
+
+    puppetwrapper node cleanup "${1}.${INFRA_DNS_SUFFIX}"
+}
+
+main "$@"
